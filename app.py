@@ -4,7 +4,8 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, parse_qs, urlparse
+from urllib.parse import urljoin
+import plotly.express as px
 
 st.set_page_config(
     page_title="中正大學企管系 - 師資瀏覽量數據儀表板",
@@ -36,7 +37,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# 輕量級高效率抓取函式（免開啟 Playwright 瀏覽器）
 def fast_fetch_and_update():
     init_db()
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -50,11 +50,9 @@ def fast_fetch_and_update():
     session.headers.update(headers)
 
     try:
-        # 1. 抓取企管系首頁
-        res = session.get(base_url, timeout=10)
+        res = session.get(base_url, timeout=15)
         soup = BeautifulSoup(res.text, "html.parser")
         
-        # 抓取包含 405 (專任) 與 404 (系主任/行政) 的老師連結
         links = soup.select("a[href*='405-1248'], a[href*='404-1248']")
         
         teacher_links = []
@@ -66,17 +64,15 @@ def fast_fetch_and_update():
                 if (name, full_url) not in teacher_links:
                     teacher_links.append((name, full_url))
 
-        # 2. 逐一發送請求抓取資料
         for name, link in teacher_links:
             research_interests = "未提供"
             views_count = 0
             
-            # 抽出網頁 ID (例如 405-1248-31588.php -> pt_id: 31588)
             try:
-                page_res = session.get(link, timeout=10)
+                # 抓取個人頁面
+                page_res = session.get(link, timeout=15)
                 page_soup = BeautifulSoup(page_res.text, "html.parser")
 
-                # 解析研究領域
                 for h3 in page_soup.find_all("h3"):
                     if "研究領域" in h3.get_text() or "專長" in h3.get_text():
                         next_div = h3.find_next_sibling("div")
@@ -84,19 +80,18 @@ def fast_fetch_and_update():
                             research_interests = next_div.get_text(" ", strip=True)
                         break
 
-                # 直接向中正大學系統 API 查詢精確數字，不用等 JS 渲染
-                # 從網址解析出 ID
+                # 透過系統 API 查詢最新瀏覽數字
                 filename = link.split("/")[-1].split("?")[0]
                 parts = filename.replace(".php", "").split("-")
                 if len(parts) >= 3:
                     pt_id = parts[2].split(",")[0]
                     api_url = f"https://busadm.ccu.edu.tw/app/index.php?Action=mobileptstatistic&Op=getptsimplecount&pt_id={pt_id}"
-                    api_res = session.get(api_url, timeout=5)
+                    api_res = session.get(api_url, timeout=10)
                     raw_views = api_res.text.strip().replace('"', '').replace(',', '')
                     if raw_views.isdigit():
                         views_count = int(raw_views)
 
-                # 若 API 未回傳，回退從頁面 HTML 抓取
+                # 回退方案
                 if views_count == 0:
                     pt_i = page_soup.select_one(".PtStatistic i")
                     if pt_i:
@@ -111,7 +106,6 @@ def fast_fetch_and_update():
                 conn = get_db_connection()
                 cursor = conn.cursor()
                 try:
-                    # 取得歷史資料計算日成長
                     cursor.execute('''
                         SELECT total_views FROM daily_views 
                         WHERE teacher_name = ? AND record_date != ?
@@ -122,6 +116,7 @@ def fast_fetch_and_update():
                     
                     daily_growth = (views_count - prev_views) if (prev_views is not None and views_count >= prev_views) else 0
 
+                    # 刪除舊資料並寫入最新實時資料
                     cursor.execute('DELETE FROM daily_views WHERE record_date = ? AND teacher_name = ?', (today_str, name))
                     cursor.execute('''
                         INSERT INTO daily_views 
@@ -133,10 +128,10 @@ def fast_fetch_and_update():
                     conn.close()
 
     except Exception as e:
-        st.error(f"更新過程發生異常: {e}")
+        st.error(f"更新異常: {e}")
     return True
 
-@st.cache_data(ttl=86400, show_spinner="☁️ 雲端系統正在檢查數據更新，請稍候...")
+@st.cache_data(ttl=86400)
 def auto_run_crawler():
     return fast_fetch_and_update()
 
@@ -147,7 +142,7 @@ st.markdown("本系統由雲端自動定時更新，提供即時師資瀏覽量�
 st.sidebar.header("⚙️ 系統操作與控制")
 
 if st.sidebar.button("🔄 立即重新抓取最新數據"):
-    with st.spinner("⏳ 正在即時抓取中正企管系官網數據，請稍候約 3~5 秒..."):
+    with st.spinner("⏳ 正在即時抓取中正企管系官網數據..."):
         st.cache_data.clear()
         fast_fetch_and_update()
         st.success("✅ 最新數據已成功更新完畢！")
@@ -225,13 +220,31 @@ else:
     st.subheader("📈 Top 10 熱門教授瀏覽量圖表")
     chart_type = st.radio("選擇圖表指標：", ("總瀏覽數 Top 10", "每日新增瀏覽數 Top 10"), horizontal=True)
     
-    # 圖表完美降序（高 → 低）排列機制
+    # 解決【問題 1】：使用 Plotly 顯式指定 categoryorder="total descending"，確保絕對由高到低排列
     if chart_type == "總瀏覽數 Top 10":
         chart_df = df.sort_values(by="總瀏覽數", ascending=False).head(10)
-        st.bar_chart(chart_df, x="教授姓名", y="總瀏覽數", color="#1f77b4")
+        fig = px.bar(
+            chart_df, 
+            x="教授姓名", 
+            y="總瀏覽數",
+            text="總瀏覽數",
+            color_discrete_sequence=["#1f77b4"]
+        )
+        fig.update_layout(xaxis={'categoryorder': 'total descending'})
+        fig.update_traces(texttemplate='%{text}', textposition='outside')
+        st.plotly_chart(fig, use_container_width=True)
     else:
         chart_df = df.sort_values(by="每日新增瀏覽數", ascending=False).head(10)
-        st.bar_chart(chart_df, x="教授姓名", y="每日新增瀏覽數", color="#ff7f0e")
+        fig = px.bar(
+            chart_df, 
+            x="教授姓名", 
+            y="每日新增瀏覽數",
+            text="每日新增瀏覽數",
+            color_discrete_sequence=["#ff7f0e"]
+        )
+        fig.update_layout(xaxis={'categoryorder': 'total descending'})
+        fig.update_traces(texttemplate='%{text}', textposition='outside')
+        st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 

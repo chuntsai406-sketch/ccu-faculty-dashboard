@@ -43,9 +43,8 @@ def get_yesterday_views(cursor, teacher_name):
     result = cursor.fetchone()
     return result[0] if result else None
 
-# 自動爬蟲邏輯 (快取 24 小時)
-@st.cache_data(ttl=86400, show_spinner="☁️ 正在連線至中正企管系官網抓取最新數據，請稍候約 1 分鐘...")
-def auto_run_crawler():
+# 核心爬蟲執行函式
+def fetch_and_update_db():
     init_db()
     today_str = datetime.now().strftime("%Y-%m-%d")
     base_url = "https://busadm.ccu.edu.tw/p/412-1248-3236.php?Lang=zh-tw"
@@ -110,25 +109,32 @@ def auto_run_crawler():
             conn.commit()
             browser.close()
     except Exception as e:
-        st.error(f"自動更新過程發生異常: {e}")
+        st.error(f"更新過程發生異常: {e}")
     finally:
         conn.close()
-    
     return True
+
+# 自動定期執行（快取 24 小時）
+@st.cache_data(ttl=86400, show_spinner="☁️ 雲端系統正在檢查數據更新，請稍候...")
+def auto_run_crawler():
+    return fetch_and_update_db()
 
 # --- 網頁主要 UI ---
 st.title("📊 中正大學企管系 - 師資瀏覽數據視覺化看板")
 st.markdown("本系統由雲端自動定時更新，提供即時師資瀏覽量與熱門研究領域排序分析。")
 
-# 側邊欄設計
+# 側邊欄控制
 st.sidebar.header("⚙️ 系統操作與控制")
 
-# 新增「即時強制更新」按鈕
-if st.sidebar.button("🔄 立即重新抓取最新數據", help="點擊此按鈕將清除快取並立即對官網發動爬蟲"):
-    auto_run_crawler.clear() # 清除快取
-    st.rerun() # 重新載入頁面
+# 即時手動強制更新（直接繞過快取執行）
+if st.sidebar.button("🔄 立即重新抓取最新數據"):
+    with st.spinner("⏳ 正在即時抓取中正企管系最新瀏覽數，請稍候約 1 分鐘..."):
+        fetch_and_update_db()
+        st.cache_data.clear()
+        st.success("✅ 最新數據已抓取並更新完畢！")
+        st.rerun()
 
-# 執行爬蟲/載入快取
+# 觸發日常自動更新/載入快取
 auto_run_crawler()
 
 def load_data():
@@ -158,7 +164,7 @@ def load_data():
 df, latest_date = load_data()
 
 if df is None or df.empty:
-    st.warning("⚠️ 資料庫初始化中，請重新整理頁面...")
+    st.warning("⚠️ 資料庫初始化中，請點擊左側重新抓取數據...")
 else:
     st.success(f"📅 最新數據更新日期：**{latest_date}** （共 {len(df)} 位師資）")
 

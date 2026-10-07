@@ -1,5 +1,6 @@
 import sqlite3
 import requests
+import re
 import pandas as pd
 import streamlit as st
 from datetime import datetime
@@ -37,47 +38,50 @@ def init_db():
     conn.commit()
     conn.close()
 
-def get_real_views_from_api(session, link):
-    """結構化解析：從頁面與 API 取得最高、最新的真實瀏覽數字"""
-    views_candidates = []
+def parse_teacher_views(session, link):
+    """標準 DOM 解析：直接進入頁面提取最新瀏覽數與研究領域"""
+    views = 0
+    research_field = "未提供"
     
-    # 提取 URL 中的文章 ID (例如 31588, 42958)
-    filename = link.split("/")[-1].split("?")[0]
-    parts = filename.replace(".php", "").split("-")
-    
-    # 1. 嘗試直接向中正大學官方統計 API 查詢
-    if len(parts) >= 3:
-        pt_id = parts[2].split(",")[0]
-        api_url = f"https://busadm.ccu.edu.tw/app/index.php?Action=mobileptstatistic&Op=getptsimplecount&pt_id={pt_id}"
-        try:
-            api_res = session.get(api_url, timeout=5)
-            raw_views = api_res.text.strip().replace('"', '').replace(',', '')
-            if raw_views.isdigit():
-                views_candidates.append(int(raw_views))
-        except Exception:
-            pass
-
-    # 2. 嘗試解析 HTML 頁面內的 .PtStatistic 標籤
     try:
-        page_res = session.get(link, timeout=5)
-        page_soup = BeautifulSoup(page_res.text, "html.parser")
-        pt_i = page_soup.select_one(".PtStatistic i")
-        if pt_i:
-            v_str = pt_i.get_text(strip=True).replace(",", "")
-            if v_str.isdigit():
-                views_candidates.append(int(v_str))
-    except Exception:
+        res = session.get(link, timeout=10)
+        res.encoding = 'utf-8'
+        soup = BeautifulSoup(res.text, "html.parser")
+        
+        # 1. 抓取瀏覽數：尋找 .PtStatistic 或包含「瀏覽數」的區塊
+        pt_stat = soup.select_one(".PtStatistic i, .PtStatistic span, .PtStatistic")
+        if pt_stat:
+            nums = re.findall(r'\d+', pt_stat.get_text().replace(',', ''))
+            if nums:
+                views = int(nums[0])
+        
+        # 備用方案：如果在全文搜尋數字
+        if views == 0:
+            text_search = re.search(r'瀏覽數[：:\s]*(\d[\d,.]*)', soup.get_text())
+            if text_search:
+                views = int(text_search.group(1).replace(',', ''))
+
+        # 2. 抓取研究領域/專長
+        for h3 in soup.find_all(["h3", "h4", "strong"]):
+            text = h3.get_text(strip=True)
+            if "研究領域" in text or "專長" in text:
+                next_div = h3.find_next_sibling(["div", "p", "span"])
+                if next_div and next_div.get_text(strip=True):
+                    research_field = next_div.get_text(" ", strip=True)
+                break
+    except Exception as e:
         pass
 
-    return max(views_candidates) if views_candidates else 0
+    return views, research_field
 
-def fast_fetch_and_update():
+def fetch_and_update_all():
     init_db()
     today_str = datetime.now().strftime("%Y-%m-%d")
     base_url = "https://busadm.ccu.edu.tw/p/412-1248-3236.php?Lang=zh-tw"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://busadm.ccu.edu.tw/"
     }
@@ -85,54 +89,52 @@ def fast_fetch_and_update():
     session = requests.Session()
     session.headers.update(headers)
 
+    logs = [] # 記錄除錯訊息
+    
     try:
+        # 先造訪企管系首頁建立 Session Cookie
+        init_res = session.get("https://busadm.ccu.edu.tw/", timeout=10)
         res = session.get(base_url, timeout=10)
+        res.encoding = 'utf-8'
         soup = BeautifulSoup(res.text, "html.parser")
         
-        # 抓取包含 405 (專任) 與 404 (系主任/行政) 的老師連結
+        # 抓取所有包含教師頁面的連結 (405專任、404行政/系主任)
         links = soup.select("a[href*='405-1248'], a[href*='404-1248']")
         
-        teacher_map = {} # 用字典合併同名老師的多個頁面，確保取到最高瀏覽數
-        
+        teacher_map = {}
         for a in links:
             href = a.get("href", "")
             name = a.get_text(strip=True)
-            if name and name not in ["專任教師", "兼任教師", "首頁", "聯絡我們", "更多", "系主任"] and len(name) <= 6:
+            # 過濾非教師名字
+            if name and name not in ["專任教師", "兼任教師", "首頁", "聯絡我們", "更多", "系主任"] and len(name) <= 5:
                 full_url = urljoin(base_url, href)
                 if name not in teacher_map:
                     teacher_map[name] = []
-                teacher_map[name].append(full_url)
+                if full_url not in teacher_map[name]:
+                    teacher_map[name].append(full_url)
 
+        logs.append(f"🔍 成功找到 {len(teacher_map)} 位教師連結，開始抓取數據...")
+
+        success_count = 0
         for name, url_list in teacher_map.items():
             max_views = 0
+            best_field = "未提供"
             best_link = url_list[0]
-            research_field = "未提供"
 
-            # 遍歷該老師的所有頁面連結（例如系主任頁 + 專任教授頁），取最大瀏覽值
+            # 同名老師可能有多個頁面（如專任 + 系主任），對每個頁面抓取並取最大值
             for link in url_list:
-                views = get_real_views_from_api(session, link)
+                views, field = parse_teacher_views(session, link)
                 if views > max_views:
                     max_views = views
                     best_link = link
+                if field != "未提供":
+                    best_field = field
 
-                # 順便抓研究領域
-                try:
-                    p_res = session.get(link, timeout=5)
-                    p_soup = BeautifulSoup(p_res.text, "html.parser")
-                    for h3 in p_soup.find_all("h3"):
-                        if "研究領域" in h3.get_text() or "專長" in h3.get_text():
-                            next_div = h3.find_next_sibling("div")
-                            if next_div and next_div.get_text(strip=True):
-                                research_field = next_div.get_text(" ", strip=True)
-                            break
-                except Exception:
-                    pass
-
-            # 寫入資料庫
             if max_views > 0:
                 conn = get_db_connection()
                 cursor = conn.cursor()
                 try:
+                    # 計算今日新增
                     cursor.execute('''
                         SELECT total_views FROM daily_views 
                         WHERE teacher_name = ? AND record_date != ?
@@ -143,19 +145,27 @@ def fast_fetch_and_update():
                     
                     daily_growth = (max_views - prev_views) if (prev_views is not None and max_views >= prev_views) else 0
 
+                    # 寫入 SQLite
                     cursor.execute('DELETE FROM daily_views WHERE record_date = ? AND teacher_name = ?', (today_str, name))
                     cursor.execute('''
                         INSERT INTO daily_views 
                         (record_date, teacher_name, research_field, total_views, daily_growth, profile_url)
                         VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (today_str, name, research_field, max_views, daily_growth, best_link))
+                    ''', (today_str, name, best_field, max_views, daily_growth, best_link))
                     conn.commit()
+                    success_count += 1
+                    logs.append(f"✅ {name}: 瀏覽數 {max_views}")
                 finally:
                     conn.close()
+            else:
+                logs.append(f"❌ {name}: 未能解析到瀏覽數")
+
+        logs.append(f"🎉 更新完成！共成功更新 {success_count} 位教師數據。")
 
     except Exception as e:
-        st.error(f"即時更新發生異常: {e}")
-    return True
+        logs.append(f"⚠️ 抓取過程發生異常: {str(e)}")
+
+    return logs
 
 # --- UI 介面 ---
 st.title("📊 中正大學企管系 - 師資瀏覽數據視覺化看板")
@@ -163,14 +173,16 @@ st.markdown("本系統由雲端自動定時更新，提供即時師資瀏覽量�
 
 st.sidebar.header("⚙️ 系統操作與控制")
 
-if st.sidebar.button("🔄 強制重刷並獲取最新數據"):
-    st.cache_data.clear() # 徹底清除 Streamlit 雲端快取
-    with st.spinner("⏳ 正在即時穿透抓取中正企管系官網數據，請稍候..."):
-        fast_fetch_and_update()
-        st.success("✅ 最新數據已成功更新完畢！")
+if st.sidebar.button("🔄 強制執行爬蟲抓取最新數據"):
+    st.cache_data.clear()
+    with st.spinner("⏳ 正在即時連線中正企管系官網更新數據..."):
+        logs = fetch_and_update_all()
+        st.success("✅ 爬蟲執行完畢！")
+        with st.expander("🔍 點此查看即時抓取日誌 (Debug Logs)", expanded=True):
+            for log in logs:
+                st.write(log)
         st.rerun()
 
-# 載入資料
 def load_data():
     conn = get_db_connection()
     try:
@@ -196,14 +208,15 @@ def load_data():
     finally:
         conn.close()
 
-# 首次進來無資料時自動執行
 df, latest_date = load_data()
+
+# 若初次進入尚無資料，自動跑一次
 if df is None or df.empty:
-    fast_fetch_and_update()
+    logs = fetch_and_update_all()
     df, latest_date = load_data()
 
 if df is None or df.empty:
-    st.warning("⚠️ 資料庫初始化中，請點擊左側「強制重刷並獲取最新數據」按鈕...")
+    st.warning("⚠️ 資料庫初始化中，請點擊左側「強制執行爬蟲抓取最新數據」按鈕...")
 else:
     st.success(f"📅 最新數據更新日期：**{latest_date}** （共 {len(df)} 位師資）")
 

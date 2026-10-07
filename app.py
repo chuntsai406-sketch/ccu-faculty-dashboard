@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import subprocess
 import pandas as pd
 import streamlit as st
 from datetime import datetime
@@ -42,20 +43,18 @@ def get_yesterday_views(cursor, teacher_name):
     result = cursor.fetchone()
     return result[0] if result else None
 
-# 自動爬蟲邏輯 (設定 ttl=86400 秒，代表 24 小時自動執行一次)
-@st.cache_data(ttl=86400, show_spinner="☁️ 雲端系統正在抓取最新數據，請稍候約 1~2 分鐘...")
+# 自動爬蟲邏輯 (24 小時自動執行一次)
+@st.cache_data(ttl=86400, show_spinner="☁️ 雲端系統正在更新最新數據...")
 def auto_run_crawler():
     init_db()
     today_str = datetime.now().strftime("%Y-%m-%d")
     base_url = "https://busadm.ccu.edu.tw/p/412-1248-3236.php?Lang=zh-tw"
     
-    # 安裝 Playwright 瀏覽器元件（若未安裝）
-    import subprocess
-try:
-    # 嘗試安裝 chromium 核心
-    subprocess.run(["playwright", "install", "chromium"], check=True)
-except Exception as e:
-    pass
+    # 安全安裝 Playwright 瀏覽器元件
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception:
+        pass
     
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -97,7 +96,7 @@ except Exception as e:
                             if next_div and next_div.get_text(strip=True):
                                 research_interests = next_div.get_text(" ", strip=True)
                             break
-                except:
+                except Exception:
                     pass
 
                 prev_views = get_yesterday_views(cursor, name)

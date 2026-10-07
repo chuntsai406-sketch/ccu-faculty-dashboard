@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from urllib.parse import urljoin
 
-# 設定頁面
 st.set_page_config(
     page_title="中正大學企管系 - 師資瀏覽量數據儀表板",
     page_icon="📊",
@@ -34,16 +33,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-def get_yesterday_views(cursor, teacher_name):
-    cursor.execute('''
-        SELECT total_views FROM daily_views 
-        WHERE teacher_name = ? 
-        ORDER BY record_date DESC LIMIT 1
-    ''', (teacher_name,))
-    result = cursor.fetchone()
-    return result[0] if result else None
-
-# 核心爬蟲執行函式
 def fetch_and_update_db():
     init_db()
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -61,11 +50,12 @@ def fetch_and_update_db():
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
+            # 模擬一般使用者瀏覽器背景
+            page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
             page.goto(base_url, timeout=60000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)
             
             soup = BeautifulSoup(page.content(), "html.parser")
-            # 修正：同時匹配 405-1248 (專任教師) 與 404-1248 (系主任/特殊職務)
             links = soup.select("a[href*='405-1248'], a[href*='404-1248']")
             
             teacher_links = []
@@ -81,11 +71,12 @@ def fetch_and_update_db():
                 research_interests = "未提供"
                 views_count = 0
                 try:
-                    page.goto(link, timeout=60000)
-                    page.wait_for_selector(".PtStatistic i", timeout=8000)
-                    page.wait_for_timeout(1000) # 給予 extra 時間載入數字
-                    detail_soup = BeautifulSoup(page.content(), "html.parser")
+                    page.goto(link, timeout=60000, wait_until="networkidle")
+                    # 強制等待瀏覽數數字元素載入完成
+                    page.wait_for_selector(".PtStatistic i", timeout=10000)
+                    page.wait_for_timeout(1500) # 給予 AJAX 渲染緩衝時間
                     
+                    detail_soup = BeautifulSoup(page.content(), "html.parser")
                     pt_i = detail_soup.select_one(".PtStatistic i")
                     if pt_i and pt_i.get_text(strip=True).isdigit():
                         views_count = int(pt_i.get_text(strip=True))
@@ -96,15 +87,28 @@ def fetch_and_update_db():
                             if next_div and next_div.get_text(strip=True):
                                 research_interests = next_div.get_text(" ", strip=True)
                             break
-                except Exception:
+                except Exception as e:
                     pass
 
                 if views_count > 0:
-                    prev_views = get_yesterday_views(cursor, name)
+                    # 先取得歷史紀錄，計算日成長
+                    cursor.execute('''
+                        SELECT total_views FROM daily_views 
+                        WHERE teacher_name = ? AND record_date != ?
+                        ORDER BY record_date DESC LIMIT 1
+                    ''', (name, today_str))
+                    prev_res = cursor.fetchone()
+                    prev_views = prev_res[0] if prev_res else None
+                    
                     daily_growth = (views_count - prev_views) if (prev_views is not None and views_count >= prev_views) else 0
 
+                    # 強制覆蓋寫入今日最新資料
                     cursor.execute('''
-                        INSERT OR REPLACE INTO daily_views 
+                        DELETE FROM daily_views WHERE record_date = ? AND teacher_name = ?
+                    ''', (today_str, name))
+                    
+                    cursor.execute('''
+                        INSERT INTO daily_views 
                         (record_date, teacher_name, research_field, total_views, daily_growth, profile_url)
                         VALUES (?, ?, ?, ?, ?, ?)
                     ''', (today_str, name, research_interests, views_count, daily_growth, link))
@@ -117,23 +121,21 @@ def fetch_and_update_db():
         conn.close()
     return True
 
-# 自動定期執行（快取 24 小時）
 @st.cache_data(ttl=86400, show_spinner="☁️ 雲端系統正在檢查數據更新，請稍候...")
 def auto_run_crawler():
     return fetch_and_update_db()
 
-# --- 網頁主要 UI ---
+# --- UI 介面 ---
 st.title("📊 中正大學企管系 - 師資瀏覽數據視覺化看板")
 st.markdown("本系統由雲端自動定時更新，提供即時師資瀏覽量與熱門研究領域排序分析。")
 
-# 側邊欄控制
 st.sidebar.header("⚙️ 系統操作與控制")
 
 if st.sidebar.button("🔄 立即重新抓取最新數據"):
     with st.spinner("⏳ 正在即時連線中正企管系官網抓取，請稍候約 1~2 分鐘..."):
-        fetch_and_update_db()
         st.cache_data.clear()
-        st.success("✅ 最新數據已更新完畢！")
+        fetch_and_update_db()
+        st.success("✅ 最新數據已成功由官網即時抓取並更新完畢！")
         st.rerun()
 
 auto_run_crawler()

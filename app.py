@@ -50,7 +50,12 @@ def auto_run_crawler():
     base_url = "https://busadm.ccu.edu.tw/p/412-1248-3236.php?Lang=zh-tw"
     
     # 安裝 Playwright 瀏覽器元件（若未安裝）
-    os.system("playwright install chromium")
+    import subprocess
+try:
+    # 嘗試安裝 chromium 核心
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+except Exception as e:
+    pass
     
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()

@@ -61,17 +61,18 @@ def fetch_and_update_db():
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(base_url)
+            page.goto(base_url, timeout=60000)
             page.wait_for_timeout(2000)
             
             soup = BeautifulSoup(page.content(), "html.parser")
-            links = soup.select("a[href*='405-1248']")
+            # 修正：同時匹配 405-1248 (專任教師) 與 404-1248 (系主任/特殊職務)
+            links = soup.select("a[href*='405-1248'], a[href*='404-1248']")
             
             teacher_links = []
             for a in links:
                 href = a.get("href", "")
                 name = a.get_text(strip=True)
-                if name and name not in ["專任教師", "兼任教師", "首頁", "聯絡我們", "更多"] and len(name) <= 6:
+                if name and name not in ["專任教師", "兼任教師", "首頁", "聯絡我們", "更多", "系主任"] and len(name) <= 6:
                     full_url = urljoin(base_url, href)
                     if (name, full_url) not in teacher_links:
                         teacher_links.append((name, full_url))
@@ -80,8 +81,9 @@ def fetch_and_update_db():
                 research_interests = "未提供"
                 views_count = 0
                 try:
-                    page.goto(link)
-                    page.wait_for_selector(".PtStatistic i", timeout=5000)
+                    page.goto(link, timeout=60000)
+                    page.wait_for_selector(".PtStatistic i", timeout=8000)
+                    page.wait_for_timeout(1000) # 給予 extra 時間載入數字
                     detail_soup = BeautifulSoup(page.content(), "html.parser")
                     
                     pt_i = detail_soup.select_one(".PtStatistic i")
@@ -97,14 +99,15 @@ def fetch_and_update_db():
                 except Exception:
                     pass
 
-                prev_views = get_yesterday_views(cursor, name)
-                daily_growth = (views_count - prev_views) if (prev_views is not None and views_count >= prev_views) else 0
+                if views_count > 0:
+                    prev_views = get_yesterday_views(cursor, name)
+                    daily_growth = (views_count - prev_views) if (prev_views is not None and views_count >= prev_views) else 0
 
-                cursor.execute('''
-                    INSERT OR REPLACE INTO daily_views 
-                    (record_date, teacher_name, research_field, total_views, daily_growth, profile_url)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (today_str, name, research_interests, views_count, daily_growth, link))
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO daily_views 
+                        (record_date, teacher_name, research_field, total_views, daily_growth, profile_url)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (today_str, name, research_interests, views_count, daily_growth, link))
 
             conn.commit()
             browser.close()
@@ -126,15 +129,13 @@ st.markdown("本系統由雲端自動定時更新，提供即時師資瀏覽量�
 # 側邊欄控制
 st.sidebar.header("⚙️ 系統操作與控制")
 
-# 即時手動強制更新（直接繞過快取執行）
 if st.sidebar.button("🔄 立即重新抓取最新數據"):
-    with st.spinner("⏳ 正在即時抓取中正企管系最新瀏覽數，請稍候約 1 分鐘..."):
+    with st.spinner("⏳ 正在即時連線中正企管系官網抓取，請稍候約 1~2 分鐘..."):
         fetch_and_update_db()
         st.cache_data.clear()
-        st.success("✅ 最新數據已抓取並更新完畢！")
+        st.success("✅ 最新數據已更新完畢！")
         st.rerun()
 
-# 觸發日常自動更新/載入快取
 auto_run_crawler()
 
 def load_data():

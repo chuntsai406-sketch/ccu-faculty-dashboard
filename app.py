@@ -1,12 +1,10 @@
-import os
 import sqlite3
-import subprocess
+import requests
 import pandas as pd
 import streamlit as st
 from datetime import datetime
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-from urllib.parse import urljoin
+from urllib.parse import urljoin, parse_qs, urlparse
 
 st.set_page_config(
     page_title="中正大學企管系 - 師資瀏覽量數據儀表板",
@@ -17,7 +15,7 @@ st.set_page_config(
 DB_NAME = "ccu_faculty.db"
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_NAME, timeout=60.0)
+    conn = sqlite3.connect(DB_NAME, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
@@ -38,99 +36,109 @@ def init_db():
     conn.commit()
     conn.close()
 
-def fetch_and_update_db():
+# 輕量級高效率抓取函式（免開啟 Playwright 瀏覽器）
+def fast_fetch_and_update():
     init_db()
     today_str = datetime.now().strftime("%Y-%m-%d")
     base_url = "https://busadm.ccu.edu.tw/p/412-1248-3236.php?Lang=zh-tw"
     
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    session = requests.Session()
+    session.headers.update(headers)
+
     try:
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-    except Exception:
-        pass
+        # 1. 抓取企管系首頁
+        res = session.get(base_url, timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
+        
+        # 抓取包含 405 (專任) 與 404 (系主任/行政) 的老師連結
+        links = soup.select("a[href*='405-1248'], a[href*='404-1248']")
+        
+        teacher_links = []
+        for a in links:
+            href = a.get("href", "")
+            name = a.get_text(strip=True)
+            if name and name not in ["專任教師", "兼任教師", "首頁", "聯絡我們", "更多", "系主任"] and len(name) <= 6:
+                full_url = urljoin(base_url, href)
+                if (name, full_url) not in teacher_links:
+                    teacher_links.append((name, full_url))
 
-    results_log = []
+        # 2. 逐一發送請求抓取資料
+        for name, link in teacher_links:
+            research_interests = "未提供"
+            views_count = 0
+            
+            # 抽出網頁 ID (例如 405-1248-31588.php -> pt_id: 31588)
+            try:
+                page_res = session.get(link, timeout=10)
+                page_soup = BeautifulSoup(page_res.text, "html.parser")
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            page = context.new_page()
-            
-            page.goto(base_url, timeout=60000)
-            page.wait_for_timeout(2000)
-            
-            soup = BeautifulSoup(page.content(), "html.parser")
-            # 抓取包含專任與系主任等所有老師頁面
-            links = soup.select("a[href*='405-1248'], a[href*='404-1248']")
-            
-            teacher_links = []
-            for a in links:
-                href = a.get("href", "")
-                name = a.get_text(strip=True)
-                if name and name not in ["專任教師", "兼任教師", "首頁", "聯絡我們", "更多", "系主任"] and len(name) <= 6:
-                    full_url = urljoin(base_url, href)
-                    if (name, full_url) not in teacher_links:
-                        teacher_links.append((name, full_url))
+                # 解析研究領域
+                for h3 in page_soup.find_all("h3"):
+                    if "研究領域" in h3.get_text() or "專長" in h3.get_text():
+                        next_div = h3.find_next_sibling("div")
+                        if next_div and next_div.get_text(strip=True):
+                            research_interests = next_div.get_text(" ", strip=True)
+                        break
 
-            for name, link in teacher_links:
-                research_interests = "未提供"
-                views_count = 0
-                try:
-                    page.goto(link, timeout=60000, wait_until="domcontentloaded")
-                    # 精確等待直到 .PtStatistic i 出現數字內容
-                    page.wait_for_function("document.querySelector('.PtStatistic i') && document.querySelector('.PtStatistic i').innerText.trim().length > 0", timeout=10000)
-                    page.wait_for_timeout(500)
-                    
-                    detail_soup = BeautifulSoup(page.content(), "html.parser")
-                    pt_i = detail_soup.select_one(".PtStatistic i")
+                # 直接向中正大學系統 API 查詢精確數字，不用等 JS 渲染
+                # 從網址解析出 ID
+                filename = link.split("/")[-1].split("?")[0]
+                parts = filename.replace(".php", "").split("-")
+                if len(parts) >= 3:
+                    pt_id = parts[2].split(",")[0]
+                    api_url = f"https://busadm.ccu.edu.tw/app/index.php?Action=mobileptstatistic&Op=getptsimplecount&pt_id={pt_id}"
+                    api_res = session.get(api_url, timeout=5)
+                    raw_views = api_res.text.strip().replace('"', '').replace(',', '')
+                    if raw_views.isdigit():
+                        views_count = int(raw_views)
+
+                # 若 API 未回傳，回退從頁面 HTML 抓取
+                if views_count == 0:
+                    pt_i = page_soup.select_one(".PtStatistic i")
                     if pt_i:
-                        raw_text = pt_i.get_text(strip=True).replace(",", "")
-                        if raw_text.isdigit():
-                            views_count = int(raw_text)
+                        v_str = pt_i.get_text(strip=True).replace(",", "")
+                        if v_str.isdigit():
+                            views_count = int(v_str)
 
-                    for h3 in detail_soup.find_all("h3"):
-                        if "研究領域" in h3.get_text() or "專長" in h3.get_text():
-                            next_div = h3.find_next_sibling("div")
-                            if next_div and next_div.get_text(strip=True):
-                                research_interests = next_div.get_text(" ", strip=True)
-                            break
-                except Exception as e:
-                    pass
+            except Exception:
+                pass
 
-                if views_count > 0:
-                    results_log.append(f"{name}: {views_count}")
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    try:
-                        cursor.execute('''
-                            SELECT total_views FROM daily_views 
-                            WHERE teacher_name = ? AND record_date != ?
-                            ORDER BY record_date DESC LIMIT 1
-                        ''', (name, today_str))
-                        prev_res = cursor.fetchone()
-                        prev_views = prev_res[0] if prev_res else None
-                        
-                        daily_growth = (views_count - prev_views) if (prev_views is not None and views_count >= prev_views) else 0
+            if views_count > 0:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                try:
+                    # 取得歷史資料計算日成長
+                    cursor.execute('''
+                        SELECT total_views FROM daily_views 
+                        WHERE teacher_name = ? AND record_date != ?
+                        ORDER BY record_date DESC LIMIT 1
+                    ''', (name, today_str))
+                    prev_res = cursor.fetchone()
+                    prev_views = prev_res[0] if prev_res else None
+                    
+                    daily_growth = (views_count - prev_views) if (prev_views is not None and views_count >= prev_views) else 0
 
-                        # 先清空今天舊資料再覆蓋寫入
-                        cursor.execute('DELETE FROM daily_views WHERE record_date = ? AND teacher_name = ?', (today_str, name))
-                        cursor.execute('''
-                            INSERT INTO daily_views 
-                            (record_date, teacher_name, research_field, total_views, daily_growth, profile_url)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        ''', (today_str, name, research_interests, views_count, daily_growth, link))
-                        conn.commit()
-                    finally:
-                        conn.close()
+                    cursor.execute('DELETE FROM daily_views WHERE record_date = ? AND teacher_name = ?', (today_str, name))
+                    cursor.execute('''
+                        INSERT INTO daily_views 
+                        (record_date, teacher_name, research_field, total_views, daily_growth, profile_url)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (today_str, name, research_interests, views_count, daily_growth, link))
+                    conn.commit()
+                finally:
+                    conn.close()
 
-            browser.close()
     except Exception as e:
         st.error(f"更新過程發生異常: {e}")
-    return results_log
+    return True
 
 @st.cache_data(ttl=86400, show_spinner="☁️ 雲端系統正在檢查數據更新，請稍候...")
 def auto_run_crawler():
-    return fetch_and_update_db()
+    return fast_fetch_and_update()
 
 # --- UI 介面 ---
 st.title("📊 中正大學企管系 - 師資瀏覽數據視覺化看板")
@@ -139,10 +147,10 @@ st.markdown("本系統由雲端自動定時更新，提供即時師資瀏覽量�
 st.sidebar.header("⚙️ 系統操作與控制")
 
 if st.sidebar.button("🔄 立即重新抓取最新數據"):
-    with st.spinner("⏳ 正在即時連線中正企管系官網抓取，請稍候約 1~2 分鐘..."):
+    with st.spinner("⏳ 正在即時抓取中正企管系官網數據，請稍候約 3~5 秒..."):
         st.cache_data.clear()
-        logs = fetch_and_update_db()
-        st.success("✅ 最新數據已成功由官網即時抓取並更新完畢！")
+        fast_fetch_and_update()
+        st.success("✅ 最新數據已成功更新完畢！")
         st.rerun()
 
 auto_run_crawler()
@@ -175,7 +183,7 @@ def load_data():
 df, latest_date = load_data()
 
 if df is None or df.empty:
-    st.warning("⚠️ 資料庫初始化中，請點擊左側重新抓取數據...")
+    st.warning("⚠️ 資料庫初始化中，請點擊左側按鈕重新抓取數據...")
 else:
     st.success(f"📅 最新數據更新日期：**{latest_date}** （共 {len(df)} 位師資）")
 
@@ -193,6 +201,7 @@ else:
             df["研究領域"].str.contains(search_keyword, case=False, na=False)
         ]
 
+    # 資料表排序
     if sort_option == "依總瀏覽數排序 (高 → 低)":
         df = df.sort_values(by="總瀏覽數", ascending=False)
     elif sort_option == "依每日新增瀏覽數排序 (高 → 低)":
@@ -216,16 +225,13 @@ else:
     st.subheader("📈 Top 10 熱門教授瀏覽量圖表")
     chart_type = st.radio("選擇圖表指標：", ("總瀏覽數 Top 10", "每日新增瀏覽數 Top 10"), horizontal=True)
     
-    # 圖表呈現修正：建立獨立排好序的 DataFrame 並把「教授姓名」設為 Index 才能精準排序圖表
+    # 圖表完美降序（高 → 低）排列機制
     if chart_type == "總瀏覽數 Top 10":
         chart_df = df.sort_values(by="總瀏覽數", ascending=False).head(10)
-        # 設為 Index 並保留從高到低的順序
-        chart_data = chart_df.set_index("教授姓名")[["總瀏覽數"]]
-        st.bar_chart(chart_data)
+        st.bar_chart(chart_df, x="教授姓名", y="總瀏覽數", color="#1f77b4")
     else:
         chart_df = df.sort_values(by="每日新增瀏覽數", ascending=False).head(10)
-        chart_data = chart_df.set_index("教授姓名")[["每日新增瀏覽數"]]
-        st.bar_chart(chart_data)
+        st.bar_chart(chart_df, x="教授姓名", y="每日新增瀏覽數", color="#ff7f0e")
 
     st.divider()
 

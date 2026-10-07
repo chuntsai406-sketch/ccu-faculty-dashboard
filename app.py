@@ -43,14 +43,13 @@ def get_yesterday_views(cursor, teacher_name):
     result = cursor.fetchone()
     return result[0] if result else None
 
-# 自動爬蟲邏輯 (24 小時自動執行一次)
-@st.cache_data(ttl=86400, show_spinner="☁️ 雲端系統正在更新最新數據...")
+# 自動爬蟲邏輯 (快取 24 小時)
+@st.cache_data(ttl=86400, show_spinner="☁️ 正在連線至中正企管系官網抓取最新數據，請稍候約 1 分鐘...")
 def auto_run_crawler():
     init_db()
     today_str = datetime.now().strftime("%Y-%m-%d")
     base_url = "https://busadm.ccu.edu.tw/p/412-1248-3236.php?Lang=zh-tw"
     
-    # 安全安裝 Playwright 瀏覽器元件
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
     except Exception:
@@ -121,7 +120,15 @@ def auto_run_crawler():
 st.title("📊 中正大學企管系 - 師資瀏覽數據視覺化看板")
 st.markdown("本系統由雲端自動定時更新，提供即時師資瀏覽量與熱門研究領域排序分析。")
 
-# 觸發雲端自動更新
+# 側邊欄設計
+st.sidebar.header("⚙️ 系統操作與控制")
+
+# 新增「即時強制更新」按鈕
+if st.sidebar.button("🔄 立即重新抓取最新數據", help="點擊此按鈕將清除快取並立即對官網發動爬蟲"):
+    auto_run_crawler.clear() # 清除快取
+    st.rerun() # 重新載入頁面
+
+# 執行爬蟲/載入快取
 auto_run_crawler()
 
 def load_data():
@@ -153,9 +160,9 @@ df, latest_date = load_data()
 if df is None or df.empty:
     st.warning("⚠️ 資料庫初始化中，請重新整理頁面...")
 else:
-    st.success(f"📅 最新數據更新日期：**{latest_date}** （共 {len(df)} 位師資，全自動雲端更新）")
+    st.success(f"📅 最新數據更新日期：**{latest_date}** （共 {len(df)} 位師資）")
 
-    st.sidebar.header("🔍 篩選與排序設定")
+    st.sidebar.subheader("🔍 篩選與排序設定")
     sort_option = st.sidebar.radio(
         "選擇排序方式：",
         ("依總瀏覽數排序 (高 → 低)", "依每日新增瀏覽數排序 (高 → 低)", "依教授姓名排序")

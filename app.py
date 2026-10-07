@@ -16,7 +16,6 @@ st.set_page_config(
 
 DB_NAME = "ccu_faculty.db"
 
-# 建立獨立連線（防鎖定 WAL 模式）
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME, timeout=60.0)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -49,15 +48,19 @@ def fetch_and_update_db():
     except Exception:
         pass
 
+    results_log = []
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            page = context.new_page()
+            
             page.goto(base_url, timeout=60000)
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(2000)
             
             soup = BeautifulSoup(page.content(), "html.parser")
+            # 抓取包含專任與系主任等所有老師頁面
             links = soup.select("a[href*='405-1248'], a[href*='404-1248']")
             
             teacher_links = []
@@ -73,14 +76,17 @@ def fetch_and_update_db():
                 research_interests = "未提供"
                 views_count = 0
                 try:
-                    page.goto(link, timeout=60000, wait_until="networkidle")
-                    page.wait_for_selector(".PtStatistic i", timeout=10000)
-                    page.wait_for_timeout(1500)
+                    page.goto(link, timeout=60000, wait_until="domcontentloaded")
+                    # 精確等待直到 .PtStatistic i 出現數字內容
+                    page.wait_for_function("document.querySelector('.PtStatistic i') && document.querySelector('.PtStatistic i').innerText.trim().length > 0", timeout=10000)
+                    page.wait_for_timeout(500)
                     
                     detail_soup = BeautifulSoup(page.content(), "html.parser")
                     pt_i = detail_soup.select_one(".PtStatistic i")
-                    if pt_i and pt_i.get_text(strip=True).isdigit():
-                        views_count = int(pt_i.get_text(strip=True))
+                    if pt_i:
+                        raw_text = pt_i.get_text(strip=True).replace(",", "")
+                        if raw_text.isdigit():
+                            views_count = int(raw_text)
 
                     for h3 in detail_soup.find_all("h3"):
                         if "研究領域" in h3.get_text() or "專長" in h3.get_text():
@@ -88,14 +94,14 @@ def fetch_and_update_db():
                             if next_div and next_div.get_text(strip=True):
                                 research_interests = next_div.get_text(" ", strip=True)
                             break
-                except Exception:
+                except Exception as e:
                     pass
 
                 if views_count > 0:
+                    results_log.append(f"{name}: {views_count}")
                     conn = get_db_connection()
                     cursor = conn.cursor()
                     try:
-                        # 查之前的歷史紀錄
                         cursor.execute('''
                             SELECT total_views FROM daily_views 
                             WHERE teacher_name = ? AND record_date != ?
@@ -106,11 +112,8 @@ def fetch_and_update_db():
                         
                         daily_growth = (views_count - prev_views) if (prev_views is not None and views_count >= prev_views) else 0
 
-                        # 強制將今日同名舊紀錄刪除，覆蓋寫入最新高數值
-                        cursor.execute('''
-                            DELETE FROM daily_views WHERE record_date = ? AND teacher_name = ?
-                        ''', (today_str, name))
-                        
+                        # 先清空今天舊資料再覆蓋寫入
+                        cursor.execute('DELETE FROM daily_views WHERE record_date = ? AND teacher_name = ?', (today_str, name))
                         cursor.execute('''
                             INSERT INTO daily_views 
                             (record_date, teacher_name, research_field, total_views, daily_growth, profile_url)
@@ -123,7 +126,7 @@ def fetch_and_update_db():
             browser.close()
     except Exception as e:
         st.error(f"更新過程發生異常: {e}")
-    return True
+    return results_log
 
 @st.cache_data(ttl=86400, show_spinner="☁️ 雲端系統正在檢查數據更新，請稍候...")
 def auto_run_crawler():
@@ -138,7 +141,7 @@ st.sidebar.header("⚙️ 系統操作與控制")
 if st.sidebar.button("🔄 立即重新抓取最新數據"):
     with st.spinner("⏳ 正在即時連線中正企管系官網抓取，請稍候約 1~2 分鐘..."):
         st.cache_data.clear()
-        fetch_and_update_db()
+        logs = fetch_and_update_db()
         st.success("✅ 最新數據已成功由官網即時抓取並更新完畢！")
         st.rerun()
 
@@ -190,7 +193,6 @@ else:
             df["研究領域"].str.contains(search_keyword, case=False, na=False)
         ]
 
-    # 列表預設排序
     if sort_option == "依總瀏覽數排序 (高 → 低)":
         df = df.sort_values(by="總瀏覽數", ascending=False)
     elif sort_option == "依每日新增瀏覽數排序 (高 → 低)":
@@ -214,16 +216,16 @@ else:
     st.subheader("📈 Top 10 熱門教授瀏覽量圖表")
     chart_type = st.radio("選擇圖表指標：", ("總瀏覽數 Top 10", "每日新增瀏覽數 Top 10"), horizontal=True)
     
-    # 圖表呈現：精確由高到低排列
+    # 圖表呈現修正：建立獨立排好序的 DataFrame 並把「教授姓名」設為 Index 才能精準排序圖表
     if chart_type == "總瀏覽數 Top 10":
-        top10_df = df.sort_values(by="總瀏覽數", ascending=False).head(10)
-        # Streamlit 柱狀圖由上至下顯示，Reverse 確保高的排在最上面/左邊
-        chart_data = top10_df.sort_values(by="總瀏覽數", ascending=True)
-        st.bar_chart(data=chart_data, x="教授姓名", y="總瀏覽數", color="#1f77b4")
+        chart_df = df.sort_values(by="總瀏覽數", ascending=False).head(10)
+        # 設為 Index 並保留從高到低的順序
+        chart_data = chart_df.set_index("教授姓名")[["總瀏覽數"]]
+        st.bar_chart(chart_data)
     else:
-        top10_df = df.sort_values(by="每日新增瀏覽數", ascending=False).head(10)
-        chart_data = top10_df.sort_values(by="每日新增瀏覽數", ascending=True)
-        st.bar_chart(data=chart_data, x="教授姓名", y="每日新增瀏覽數", color="#ff7f0e")
+        chart_df = df.sort_values(by="每日新增瀏覽數", ascending=False).head(10)
+        chart_data = chart_df.set_index("教授姓名")[["每日新增瀏覽數"]]
+        st.bar_chart(chart_data)
 
     st.divider()
 

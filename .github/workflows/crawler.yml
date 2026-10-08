@@ -2,7 +2,7 @@ name: Auto Daily Faculty Crawler
 
 on:
   schedule:
-    # 每天台灣時間凌晨 02:00 (UTC 18:00) 自動執行
+    # 每天台灣時間凌晨 01:15 (UTC 18:00) 自動執行
     - cron: '0 18 * * *'
   workflow_dispatch: # 允許您隨時在 GitHub 網頁上點按鈕手動觸發
 

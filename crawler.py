@@ -24,17 +24,13 @@ def init_db():
     conn.close()
 
 def extract_clean_research_field(soup):
-    """精準提取專長領域，排除頂部導覽列與底部頁尾雜訊"""
     junk_keywords = [
         "瀏覽數", "友善列印", "JavaScript", "列印", "分享", "版權所有", 
         "系統維護", "English", "聯絡我們", "::: ", "網站導覽", "首頁"
     ]
-    
-    # 限制只在主要內容區域搜尋，避開頂部頁首與頁尾
     main_area = soup.select_one(".grid-container, .main-content, #Dyn_2_2, div[class*='content']")
     target_soup = main_area if main_area else soup
 
-    # 策略 1：優先從表格 <tr> 中尋找
     for tr in target_soup.find_all("tr"):
         tr_text = tr.get_text(strip=True)
         if any(k in tr_text for k in ["專長", "研究領域", "授課領域", "研究方向"]):
@@ -44,11 +40,9 @@ def extract_clean_research_field(soup):
                 if val and not any(j in val for j in junk_keywords):
                     return val
 
-    # 策略 2：尋找帶有專長關鍵字的標籤與下一個兄弟節點
     for elem in target_soup.find_all(["h3", "h4", "strong", "b", "div", "p", "td"]):
         text = elem.get_text(strip=True)
         if any(k in text for k in ["專長", "研究領域", "授課領域", "研究方向"]) and len(text) < 15:
-            # 嘗試抓取下一個同級標籤
             nxt = elem.find_next_sibling(["div", "p", "span", "td", "ul"])
             if not nxt:
                 nxt = elem.parent.find_next_sibling()
@@ -65,13 +59,16 @@ def run_crawler():
     base_url = "https://busadm.ccu.edu.tw/p/412-1248-3236.php?Lang=zh-tw"
     
     with sync_playwright() as p:
-        print("🚀 啟動 Chrome 瀏覽器解析中...")
+        print("🚀 啟動 Chrome 瀏覽器...")
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0.0.0 Safari/537.36")
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        )
         page = context.new_page()
 
-        print("🌐 連線中正企管系專任教師頁面...")
-        page.goto(base_url, wait_until="networkidle")
+        print("🌐 取得專任教師清單...")
+        page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2000)
         
         soup = BeautifulSoup(page.content(), "html.parser")
         main_content = soup.select_one(".grid-container, .main-content, #Dyn_2_2")
@@ -86,43 +83,53 @@ def run_crawler():
                 full_url = href if href.startswith("http") else f"https://busadm.ccu.edu.tw/p/{href}"
                 teacher_map[name] = full_url
 
-        print(f"🔍 開始精準解析 {len(teacher_map)} 位教師之數據與領域...")
+        print(f"🔍 開始解析 {len(teacher_map)} 位教師數據...")
         
-        success_count = 0
         for name, url in teacher_map.items():
             views = 0
             research_field = "未提供"
-            try:
-                page.goto(url, wait_until="domcontentloaded")
-                page.wait_for_timeout(1000)
-                
-                inner_soup = BeautifulSoup(page.content(), "html.parser")
-                
-                # 1. 抓取數字
-                stat_elem = inner_soup.select_one(".PtStatistic, div[class*='Statistic'], .i-statistic")
-                if stat_elem:
-                    nums = re.findall(r'\d+', stat_elem.get_text().replace(',', ''))
-                    if nums:
-                        views = int(nums[0])
-                
-                if views == 0:
-                    text_match = re.search(r'瀏覽次數[：:\s]*([0-9,]+)|點閱[：:\s]*([0-9,]+)', page.content())
-                    if text_match:
-                        num_str = text_match.group(1) or text_match.group(2)
-                        views = int(num_str.replace(',', ''))
+            
+            # 嘗試最多 2 次（避免網絡過慢）
+            for attempt in range(2):
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(3000)
+                    
+                    inner_soup = BeautifulSoup(page.content(), "html.parser")
+                    stat_elem = inner_soup.select_one(".PtStatistic, div[class*='Statistic'], .i-statistic")
+                    if stat_elem:
+                        nums = re.findall(r'\d+', stat_elem.get_text().replace(',', ''))
+                        if nums:
+                            views = int(nums[0])
+                    
+                    if views == 0:
+                        text_match = re.search(r'瀏覽次數[：:\s]*([0-9,]+)|點閱[：:\s]*([0-9,]+)', page.content())
+                        if text_match:
+                            num_str = text_match.group(1) or text_match.group(2)
+                            views = int(num_str.replace(',', ''))
 
-                # 2. 抓取研究領域
-                research_field = extract_clean_research_field(inner_soup)
+                    research_field = extract_clean_research_field(inner_soup)
+                    
+                    if views > 0:
+                        break # 成功抓到數字即跳出重試迴圈
+                except Exception as e:
+                    print(f"⚠️ 第 {attempt+1} 次讀取 {name} 失敗: {e}")
 
-            except Exception as e:
-                print(f"⚠️ 解析 {name} 失敗: {e}")
-
-            # 寫入 SQLite
+            # 資料庫處理：比對昨日數據
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
-            cursor.execute('SELECT total_views FROM daily_views WHERE teacher_name = ? AND record_date != ? ORDER BY record_date DESC LIMIT 1', (name, today_str))
+            cursor.execute('SELECT total_views, research_field FROM daily_views WHERE teacher_name = ? AND record_date != ? ORDER BY record_date DESC LIMIT 1', (name, today_str))
             prev_res = cursor.fetchone()
+            
             prev_views = prev_res[0] if prev_res else None
+            prev_field = prev_res[1] if prev_res else "未提供"
+
+            # 避險機制：若今日不幸抓到 0 次，則沿用昨日總數字，避免影響網頁呈現
+            if views == 0 and prev_views is not None:
+                views = prev_views
+                if research_field == "未提供":
+                    research_field = prev_field
+
             daily_growth = (views - prev_views) if (prev_views is not None and views >= prev_views) else 0
 
             cursor.execute('DELETE FROM daily_views WHERE record_date = ? AND teacher_name = ?', (today_str, name))
@@ -134,12 +141,10 @@ def run_crawler():
             conn.commit()
             conn.close()
 
-            if views > 0:
-                success_count += 1
-                print(f"✅ [{success_count}/21] {name}: {views:,} | 領域: {research_field[:25]}")
+            print(f"✅ {name}: {views:,} | 領域: {research_field[:15]}")
 
         browser.close()
-        print(f"\n🎉 修正完畢！成功更新 {success_count} 位教師數據。")
+        print("\n🎉 爬取完成！已更新所有教師數據。")
 
 if __name__ == "__main__":
     run_crawler()
